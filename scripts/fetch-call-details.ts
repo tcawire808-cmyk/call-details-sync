@@ -1,14 +1,3 @@
-/**
- * Runs in GitHub Actions on a schedule.
- *
- * 1. Launches Chromium with stealth plugin.
- * 2. Loads the saved Google session (storage-state.json), decoded from
- *    the GOOGLE_STORAGE_STATE_B64 secret. If that session is expired or
- *    missing, falls back to a fresh email + password + TOTP login.
- * 3. Opens the Google Ads Call Details saved report URL.
- * 4. Clicks Download → Excel (.xlsx), waits for the file.
- * 5. Parses the xlsx and upserts rows into Supabase.
- */
 
 import { chromium } from 'playwright-extra';
 // @ts-ignore - no types shipped
@@ -46,6 +35,22 @@ for (const [k, v] of Object.entries(REQUIRED)) {
 
 const DOWNLOAD_DIR = path.resolve('downloads');
 
+// ---- Debug helper: screenshot + page text, uploaded as a workflow artifact ---
+
+const dumpDebug = async (page: import('playwright').Page, label: string) => {
+  try {
+    await mkdir(DOWNLOAD_DIR, { recursive: true });
+    const shot = path.join(DOWNLOAD_DIR, `debug-${label}.png`);
+    await page.screenshot({ path: shot, fullPage: true });
+    const text = (await page.locator('body').innerText().catch(() => '')).slice(0, 1500);
+    console.log(`[debug:${label}] url=${page.url()}`);
+    console.log(`[debug:${label}] title=${await page.title().catch(() => '')}`);
+    console.log(`[debug:${label}] body=${text.replace(/\s+/g, ' ')}`);
+  } catch (e) {
+    console.log(`[debug:${label}] could not capture: ${String(e)}`);
+  }
+};
+
 // ---- Session file hydration -------------------------------------------------
 
 const hydrateStorageState = async (): Promise<string | undefined> => {
@@ -60,17 +65,26 @@ const hydrateStorageState = async (): Promise<string | undefined> => {
 
 const loginWithPassword = async (page: import('playwright').Page) => {
   console.log('Session expired. Logging in fresh with email + password + TOTP.');
-  await page.goto('https://accounts.google.com/');
+  await page.goto(
+    'https://accounts.google.com/signin/v2/identifier?hl=en&flowName=GlifWebSignIn&flowEntry=ServiceLogin',
+    { waitUntil: 'domcontentloaded' },
+  );
+  await page.waitForTimeout(2_000);
+  await dumpDebug(page, '1-login-page');
 
   await page.waitForSelector('input[type="email"]', { timeout: 30_000 });
   await page.fill('input[type="email"]', GOOGLE_EMAIL!);
   await page.click('#identifierNext');
 
+  await page.waitForTimeout(2_000);
+  await dumpDebug(page, '2-after-email');
   await page.waitForSelector('input[type="password"]', { timeout: 30_000 });
   // Google animates the password field in; give it a beat.
   await page.waitForTimeout(1_500);
   await page.fill('input[type="password"]', GOOGLE_PASSWORD!);
   await page.click('#passwordNext');
+  await page.waitForTimeout(3_000);
+  await dumpDebug(page, '3-after-password');
 
   // Wait for either the TOTP challenge or a successful landing page.
   try {
@@ -175,6 +189,8 @@ const upsertRows = async (rows: CallRow[]) => {
 
 // ---- Main -------------------------------------------------------------------
 
+let activePage: import('playwright').Page | null = null;
+
 const run = async () => {
   await mkdir(DOWNLOAD_DIR, { recursive: true });
   const storageStatePath = await hydrateStorageState();
@@ -194,6 +210,7 @@ const run = async () => {
   });
 
   const page = await context.newPage();
+  activePage = page;
 
   // Try to open the saved report. If we land on a login screen, re-auth.
   await page.goto(GOOGLE_ADS_REPORT_URL!, { waitUntil: 'domcontentloaded' });
@@ -232,7 +249,8 @@ const run = async () => {
   await upsertRows(rows);
 };
 
-run().catch((err) => {
+run().catch(async (err) => {
   console.error('FATAL:', err);
+  if (activePage) await dumpDebug(activePage, 'fatal');
   process.exit(1);
 });
